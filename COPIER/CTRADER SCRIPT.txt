@@ -1,0 +1,216 @@
+using System;
+using System.Net;
+using System.Linq;
+using System.Collections.Generic;
+using cAlgo.API;
+using cAlgo.API.Internals;
+using Newtonsoft.Json;
+
+namespace cAlgo.Robots
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.FullAccess)]
+    public class SignalExecutor : Robot
+    {
+        [Parameter("Magic Number", DefaultValue = 1001, MinValue = 1)]
+        public int MagicNumber { get; set; }
+
+        private string SignalApiUrl => $"http://127.0.0.1:5000/get_signal/{MagicNumber}";
+        private const string ReportApiUrl="http://127.0.0.1:5000/report_trade_close";
+        
+        [Parameter("Base Trade Label", DefaultValue = "SignalCopier")]
+        public string BaseTradeLabel { get; set; }
+
+        private class PositionState { public bool TrailingEnabled{get;set;} public double OriginalTakeProfitPrice{get;set;} public double TrailingPips{get;set;} public bool IsTrailingActive{get;set;} public bool RecoveryEnabled{get;set;} public double RecoveryTriggerPips{get;set;} public double RecoveryLotSize{get;set;} public bool HasOpenedRecoveryTrade{get;set;} public double RecoverySlPips { get; set; } public double RecoveryTpPips { get; set; } }
+        private readonly Dictionary<int,PositionState> _managedPositions=new Dictionary<int,PositionState>();
+        private WebClient _webClient;
+        
+        protected override void OnStart()
+        {
+            Print($"Portfolio Manager Client Started. Magic Number: {MagicNumber}");
+            _webClient = new WebClient();
+            Timer.Start(2);
+            Positions.Closed += OnPositionClosed;
+        }
+
+        protected override void OnTick()
+        {
+            ManageOpenPositions();
+        }
+        
+        private void ManageOpenPositions()
+        {
+            foreach(var pId in _managedPositions.Keys.ToList())
+            {
+                var p=Positions.FirstOrDefault(pos=>pos.Id==pId);
+                if(p==null){_managedPositions.Remove(pId);continue;}
+                var s=_managedPositions[pId];
+                if(s.RecoveryEnabled&&!s.HasOpenedRecoveryTrade)
+                {
+                    double currentPips = p.Pips;
+                    if (currentPips < 0 && Math.Abs(currentPips) >= s.RecoveryTriggerPips)
+                    {
+                        Print($"Pos #{p.Id} hit {Math.Abs(currentPips):F1} pips loss. Triggering RECOVERY.");
+                        var sym=Symbols.GetSymbol(p.SymbolName);
+                        var vol=sym.QuantityToVolumeInUnits(s.RecoveryLotSize);
+                        var lbl=p.Label+"_rec";
+                        var res=ExecuteMarketOrder(p.TradeType,sym.Name,vol,lbl,s.RecoverySlPips, s.RecoveryTpPips);
+                        if(res.IsSuccessful)
+                        {
+                            Print($"RECOVERY PLACED for Pos #{p.Id} with {s.RecoverySlPips} pip SL and {s.RecoveryTpPips} pip TP. New ID: #{res.Position.Id}");
+                            s.HasOpenedRecoveryTrade=true;
+                        } 
+                        else 
+                        {
+                            Print($"ERROR: Failed to place recovery trade. Reason: {res.Error}");
+                        }
+                    }
+                }
+                
+                if(s.TrailingEnabled)
+                {
+                    var sym=Symbols.GetSymbol(p.SymbolName);
+                    if(!s.IsTrailingActive)
+                    {
+                        bool isTpHit=p.TradeType==TradeType.Buy?sym.Ask>=s.OriginalTakeProfitPrice:sym.Bid<=s.OriginalTakeProfitPrice;
+                        if(isTpHit)
+                        {
+                            s.IsTrailingActive=true;
+                            Print($"Pos #{p.Id}: Virtual TP hit. Trailing Stop ACTIVE.");
+                        }
+                    }
+                    if(s.IsTrailingActive)
+                    {
+                        double newSl;
+                        double dist=s.TrailingPips*sym.PipSize;
+                        if(p.TradeType==TradeType.Buy){newSl=sym.Ask-dist;if(newSl>(p.StopLoss??0))p.ModifyStopLossPrice(newSl);}
+                        else{newSl=sym.Bid+dist;if(newSl<(p.StopLoss??double.MaxValue))p.ModifyStopLossPrice(newSl);}
+                    }
+                }
+            }
+        }
+
+        protected override void OnTimer()
+        {
+            try
+            {
+                var json=_webClient.DownloadString(SignalApiUrl);
+                var signal=JsonConvert.DeserializeObject<TradeSignal>(json);
+                if(signal?.Status!="no_new_signal"&&!string.IsNullOrEmpty(signal.Symbol)) ExecuteTrade(signal);
+            }
+            catch(Exception){}
+        }
+        
+        private void ExecuteTrade(TradeSignal signal)
+        {
+            string signalTypeEquivalentMode = (signal.ParameterType == "price") ? "precise" : "instant";
+            if (signalTypeEquivalentMode != signal.TradingMode) { Print($"Signal ignored: Parsed type '{signal.ParameterType}' != channel mode '{signal.TradingMode}'."); return; }
+            var symbol=Symbols.GetSymbol(signal.Symbol); if(symbol==null)return;
+            double lotSizeToUse=signal.LotSize;
+            if(signal.MaxLotEnabled) {
+                Print("Risk Management ON. Calculating cumulative exposure...");
+                double calculatedMaxTotalLot = Math.Round((Account.Equity / signal.MaxLotBaseCurrency) * signal.MaxLotBaseLots, 2);
+                double currentExposureLots = 0;
+                foreach (var position in Positions) {
+                    if (position.Label.StartsWith(BaseTradeLabel)) {
+                        currentExposureLots += position.VolumeInUnits / position.Symbol.LotSize;
+                    }
+                }
+                currentExposureLots = Math.Round(currentExposureLots, 2);
+                double availableLotSize = calculatedMaxTotalLot - currentExposureLots;
+                Print($"Max Total Lot: {calculatedMaxTotalLot}, Current Exposure: {currentExposureLots}, Available: {availableLotSize:F2}");
+                if (lotSizeToUse > availableLotSize) { Print($"TRADE BLOCKED: Requested lot size ({lotSizeToUse}) exceeds available risk ({availableLotSize:F2})."); return; }
+            }
+            if(lotSizeToUse<=0)return;
+            var volume=symbol.QuantityToVolumeInUnits(lotSizeToUse);
+            var tradeType=signal.Direction=="BUY"?TradeType.Buy:TradeType.Sell;
+            double? stopLoss=signal.SL;
+            double? takeProfit=signal.TP;
+            string tradeLabel = $"{BaseTradeLabel}_{signal.ChannelId}";
+            if(signal.TrailingEnabled)takeProfit=null;
+            TradeResult result=ExecuteMarketOrder(tradeType,symbol.Name,volume,tradeLabel,stopLoss,takeProfit);
+            
+            if(result.IsSuccessful&&(signal.TrailingEnabled||signal.RecoveryEnabled))
+            {
+                var p=result.Position;
+                double tpPrice;
+                if(signal.ParameterType=="pips")
+                    tpPrice=(tradeType==TradeType.Buy)?p.EntryPrice+signal.InstantTpPips*symbol.PipSize:p.EntryPrice-signal.InstantTpPips*symbol.PipSize;
+                else 
+                    tpPrice=signal.TP;
+                
+                var state=new PositionState{ TrailingEnabled=signal.TrailingEnabled, OriginalTakeProfitPrice=tpPrice, TrailingPips=signal.TrailingPips, RecoveryEnabled=signal.RecoveryEnabled, RecoveryTriggerPips = signal.RecoveryPipsLoss, RecoveryLotSize=signal.RecoveryLotSize, HasOpenedRecoveryTrade=false, IsTrailingActive=false, RecoverySlPips=signal.RecoverySlPips, RecoveryTpPips=signal.RecoveryTpPips };
+                _managedPositions.Add(p.Id,state);
+                Print($"Position #{p.Id} from channel {signal.ChannelId} is now MANAGED. Recovery: {state.RecoveryEnabled} (Trigger Pips: {state.RecoveryTriggerPips}), Trailing: {state.TrailingEnabled}");
+            }
+        }
+
+        private void OnPositionClosed(PositionClosedEventArgs args)
+        {
+            var closedPosition = args.Position;
+            if (_managedPositions.ContainsKey(closedPosition.Id)) _managedPositions.Remove(closedPosition.Id);
+            var labelParts = closedPosition.Label.Split('_');
+            if (labelParts.Length > 1 && labelParts[0] == BaseTradeLabel)
+            {
+                var channelId = labelParts[1];
+                var historicalTrade = History.LastOrDefault(t => t.PositionId == closedPosition.Id);
+                double closePrice = historicalTrade != null ? historicalTrade.ClosingPrice : 0;
+                var report = new ClosedTradeReport { MagicNumber = this.MagicNumber, ChannelId = channelId, Symbol = closedPosition.SymbolName, Direction = closedPosition.TradeType.ToString(), Pips = closedPosition.Pips, UsdProfit = closedPosition.NetProfit, EntryPrice = closedPosition.EntryPrice, ClosePrice = closePrice, AccountBalance = Account.Balance };
+                try
+                {
+                    _webClient.Headers[HttpRequestHeader.ContentType] = "application/json";
+                    string jsonPayload = JsonConvert.SerializeObject(report);
+                    _webClient.UploadString(ReportApiUrl, "POST", jsonPayload);
+                    Print($"Reported closed trade from channel {channelId} to Python backend.");
+                }
+                catch (Exception e) { Print($"ERROR: Could not report closed trade to backend: {e.Message}"); }
+            }
+        }
+
+        protected override void OnStop()
+        {
+            _webClient?.Dispose();
+            Positions.Closed -= OnPositionClosed;
+            Print("Portfolio Manager Client Stopped.");
+        }
+    }
+
+    public class ClosedTradeReport
+    {
+        [JsonProperty("magic_number")] public int MagicNumber { get; set; }
+        [JsonProperty("channel_id")] public string ChannelId { get; set; }
+        [JsonProperty("symbol")] public string Symbol { get; set; }
+        [JsonProperty("direction")] public string Direction { get; set; }
+        [JsonProperty("pips")] public double Pips { get; set; }
+        [JsonProperty("usd_profit")] public double UsdProfit { get; set; }
+        [JsonProperty("entry_price")] public double EntryPrice { get; set; }
+        [JsonProperty("close_price")] public double ClosePrice { get; set; }
+        [JsonProperty("account_balance")] public double AccountBalance { get; set; }
+    }
+
+    public class TradeSignal
+    {
+        [JsonProperty("direction")]public string Direction{get;set;}
+        [JsonProperty("symbol")]public string Symbol{get;set;}
+        [JsonProperty("entry")]public double Entry{get;set;}
+        [JsonProperty("sl")]public double SL{get;set;}
+        [JsonProperty("tp")]public double TP{get;set;}
+        [JsonProperty("parameter_type")]public string ParameterType{get;set;}
+        [JsonProperty("trading_mode")]public string TradingMode{get;set;}
+        [JsonProperty("lot_size")]public double LotSize{get;set;}
+        [JsonProperty("trailing_stop_enabled")]public bool TrailingEnabled{get;set;}
+        [JsonProperty("trailing_pips")]public double TrailingPips{get;set;}
+        [JsonProperty("recovery_trade_enabled")]public bool RecoveryEnabled{get;set;}
+        [JsonProperty("recovery_pips_loss")]public double RecoveryPipsLoss{get;set;}
+        [JsonProperty("recovery_lot_size")]public double RecoveryLotSize{get;set;}
+        [JsonProperty("recovery_sl_pips")] public double RecoverySlPips { get; set; }
+        [JsonProperty("recovery_tp_pips")] public double RecoveryTpPips { get; set; }
+        [JsonProperty("max_lot_enabled")]public bool MaxLotEnabled{get;set;}
+        [JsonProperty("max_lot_base_currency")]public double MaxLotBaseCurrency{get;set;}
+        [JsonProperty("max_lot_base_lots")]public double MaxLotBaseLots{get;set;}
+        [JsonProperty("instant_sl_pips")] public double InstantSlPips { get; set; }
+        [JsonProperty("instant_tp_pips")] public double InstantTpPips { get; set; }
+        [JsonProperty("status")]public string Status{get;set;}
+        [JsonProperty("channel_id")]public string ChannelId{get;set;}
+        [JsonProperty("cbot_magic_number")] public int CbotMagicNumber { get; set; }
+    }
+}
